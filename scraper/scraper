@@ -1,0 +1,313 @@
+# reference: https://blog.csdn.net/mmc2015/article/details/50923309
+# reference: https://docs.python.org/3/library/json.html
+# reference: https://docs.python.org/3/howto/logging.html
+from bs4 import BeautifulSoup
+import urllib
+import urllib.request
+import urllib.error
+import json
+import re
+import logging
+
+
+from graph.actor import Actor
+from graph.movie import Movie
+from graph.graph import Graph
+
+
+import os, ssl
+if (not os.environ.get('PYTHONHTTPSVERIFY', '') and
+    getattr(ssl, '_create_unverified_context', None)):
+    ssl._create_default_https_context = ssl._create_unverified_context
+
+morganFreeman = "https://en.wikipedia.org/wiki/Morgan_Freeman"
+# testurl = "https://en.wikipedia.org/wiki/Al_Pacino"
+user_agent='kle11'
+headers={'User-Agent':user_agent}
+isFirst= True
+
+
+'''
+send request to the url and return a BeautifulSoup format page
+'''
+def getHtml(url):
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        response = urllib.request.urlopen(request)
+    except urllib.error.URLError as e:
+        logging.error("url access fail:"+ str(e.reason))
+        return None
+    else:
+        wikiHtml = response.read()
+    wikiHtml = BeautifulSoup(wikiHtml, 'html.parser')
+    return wikiHtml
+
+'''
+scrap a single actor wikipage
+'''
+def scrapActor(g, url):
+    actorHtml = getHtml(url)
+    if (actorHtml is None):
+        return None
+
+    name = actorHtml.find('h1').text
+    age = actorHtml.find("span", {"class": "noprint ForceAgeToShow"})
+    if age is not None:
+        age = age.text
+        # print(age)
+        age = age.split()[1]
+        age = int(age[:-1])
+    if age is None:
+        logging.info("No age found")
+        return
+    result = Actor(name, age, url)
+    g.addActorVertex(result)
+    return result
+
+'''
+scrap a single movie wikipage
+'''
+def scrapMovie(g, url):
+
+    movieHtml = getHtml(url)
+    if(movieHtml is None):
+        return None
+
+
+    name = movieHtml.find('h1').text
+
+    temp = movieHtml.find('a', title="Help:Category")
+    if temp is None:
+        year = movieHtml.find(text="Release date")
+        if year is None:
+            year = "2018"
+        else:
+            year = year.find_next('td').text
+            if year[-1] == ']':
+                year = year[:-3]
+            for chunk in year.split():
+                if len(chunk) == 4:
+                    try:
+                        year = chunk
+                        break
+                    except ValueError:
+                        logging.error('value error of year')
+                        pass
+
+    else:
+        year = temp.find_next('li').text
+        if year[-1] == ']':
+            year = year[:-3]
+        for chunk in year.split():
+            if len(chunk) == 4:
+                try:
+                    year = chunk
+                    break
+                except ValueError:
+                    logging.error('value error of year')
+                    pass
+
+    profit = movieHtml.find(text="Box office")
+    if profit is None:
+        logging.info("Profit could not be found")
+        result = Movie(name, 0, year, url)
+        g.addMovieVertex(result)
+        return result
+    else:
+        profit = profit.find_next('td').text
+    if profit[1] != '$':
+        logging.info("Profit could not be found")
+        result = Movie(name, 0, year, url)
+        g.addMovieVertex(result)
+        return result
+    if (profit[1] == '$'):
+        profit = profit[2:]
+    if profit[-1] == ']':
+        profit = profit[:-3]
+    if profit[-7:] == "million":
+        textUnit = 1000000
+    elif profit[-7:] == "billion":
+        textUnit = 1000000000
+    else:
+        profit = re.sub("[^0-9]", "", profit)
+        result = Movie(name, int(profit), year, url)
+        g.addMovieVertex(result)
+        return result
+    profit = profit.split()[0]
+    # print(profit)
+    # profit = re.sub("^[-+]?[0-9]*\.?[0-9]+$", "", profit)
+    # print(profit+"\n")
+    try:
+        profit = float(profit)
+    except ValueError:
+        profit = int(profit)
+    profit = int(profit * textUnit)
+    # print(profit)
+    result = Movie(name, profit, year, url)
+    g.addMovieVertex(result)
+    return result
+
+'''
+scrap actors info from a movie url
+'''
+def scrapCastListOfOneMovie(g, url):
+    # print(len(g.getMovieVertices()))
+    # print(len(g.getActorVertices()))
+    movieHtml = getHtml(url)
+    if movieHtml is None: return None
+    movie = scrapMovie(g, url)
+    if movie is not None:
+        cast = movieHtml.find(id="Cast")
+        if cast is not None:
+            for li in cast.find_next('ul').findAll('li'):
+                if (li.find_next('a') is not None):
+                    a = li.find_next('a')
+                    actorUrl = 'https://en.wikipedia.org' + a['href']
+                    actor = scrapActor(g,actorUrl)
+                    if actor is not None:
+                        if actor.getAge() is not None:
+                            edgeWeight = movie.getProfit()/actor.getAge()#younger with higher weight
+                        else:
+                            edgeWeight = movie.getProfit()/100
+                        movie.addEdgeWeight(actor, edgeWeight)
+                        # movie.addActorToCastList(actor)
+                        actor.addEdgeWeight(movie, edgeWeight)
+                        logging.info("Actor added: {}".format(actor.getName()))
+                        # actor.addMovieToMoviesList(movie)
+                        # if len(g.getMovieVertices()) < 125 or len(g.getActorVertices()) < 250:
+                        #     scrapMovieListsOfOneActor(g, actorUrl)
+    else:
+        logging.warning("No cast available")
+'''
+scrap movies info from a actor url
+'''
+def scrapMovieListsOfOneActor(g, url):
+    # print(len(g.getMovieVertices()))
+    # print(len(g.getActorVertices()))
+    actorHtml = getHtml(url)
+    if actorHtml is None: return None
+    actor = scrapActor(g, url)
+    if actor is not None:
+        if actorHtml.find(id="Filmography") is not None:
+            for li in actorHtml.find(id="Filmography").find_next('ul').findAll('li'):
+                a = li.find_next('a')
+                movieUrl = 'https://en.wikipedia.org' + a['href']
+                movie = scrapMovie(g, movieUrl)
+                if movie is not None:
+                    if actor.getAge() is not None:
+                        edgeWeight = movie.getProfit() / actor.getAge()  # younger with higher weight
+                    else:
+                        edgeWeight = movie.getProfit() / 100
+                    movie.addEdgeWeight(actor, edgeWeight)
+                    # movie.addActorToCastList(actor)
+                    actor.addEdgeWeight(movie, edgeWeight)
+                    # actor.addMovieToMoviesList(movie)
+                    scrapCastListOfOneMovie(g, movieUrl)
+                    if len(g.getActorVertices()) > 450 and isFirst:
+                        break
+        elif actorHtml.find(id="Film") is not None:
+            for tr in actorHtml.find(id="Film").find_next('table').findAll('tr'):
+                a = tr.find_next('a')
+                movieUrl = 'https://en.wikipedia.org' + a['href']
+                movie = scrapMovie(g, movieUrl)
+                if movie is not None:
+                    if actor.getAge() is not None:
+                        edgeWeight = movie.getProfit() / actor.getAge()  # younger with higher weight
+                    else:
+                        edgeWeight = movie.getProfit() / 100
+                    movie.addEdgeWeight(actor, edgeWeight)
+                    # movie.addActorToCastList(actor)
+                    actor.addEdgeWeight(movie, edgeWeight)
+                    # actor.addMovieToMoviesList(movie)
+                    scrapCastListOfOneMovie(g, movieUrl)
+                    if len(g.getActorVertices()) > 450 and isFirst:
+                        break
+
+
+#
+def startMoviesFromActor(g, url):
+    logging.basicConfig(filename='logfile.log', filemode='w', level=logging.DEBUG)
+    actorHtml = getHtml(url)
+    if actorHtml is None: return None
+    if actorHtml.find(id="Filmography") is not None or actorHtml.find(id="Film") is not None :
+        scrapMovieListsOfOneActor(g, url)
+        isFirst = False
+        a = list(g.getActorVertices())
+        for actor in a:
+            scrapMovieListsOfOneActor(g, (g.getActorVertex(actor)).getUrl())
+            if(len(g.getMovieVertices())>125):#meet the requirement
+                break
+    else:
+        logging.warning("No film found")
+        return -1
+    return 0
+
+def storeJSON(g, fileLocation):
+    m = g.getMovieVerticesDict()
+    a = g.getActorVerticesDict()
+    print(len(m))
+    print(len(a))
+    mFileLocation= fileLocation+"Movie.json"
+    with open(mFileLocation, 'w') as f:
+        # f.write("[")
+        for k,v in m.items():
+            f.write(v.get_Movie())
+        #     f.write(",")
+        # f.seek(f.tell()-1, os.SEEK_SET)
+        # f.truncate()
+        # f.write("]")
+    aFileLocation = fileLocation + "Actor.json"
+    with open(aFileLocation, 'w') as f:
+        # f.write("[")
+        for k, v in a.items():
+            f.write(v.get_Actor())
+        #     f.write(",")
+        # f.seek(f.tell() - 1, os.SEEK_SET)
+        # f.truncate()
+        # f.write("]")
+
+def loadJSON(g, fileLocation):
+    mFileLocation = fileLocation + "Movie.json"
+    with open(mFileLocation, 'r') as jsonData:
+        data = json.load(jsonData)
+        for entry in data:
+           g.addMovieVertex(entry)
+    aFileLocation = fileLocation + "Actor.json"
+    with open(aFileLocation, 'r') as jsonData:
+        data = json.load(jsonData)
+        for entry in data:
+           g.addActorVertex(entry)
+
+
+
+if __name__ == "__main__":
+
+    logging.basicConfig(filename='logfile.log', filemode='w', level=logging.DEBUG)
+    logging.info('main start')
+    g = Graph()
+    logging.info('start scraping')
+    startMoviesFromActor(g, morganFreeman)
+    logging.info('end scraping')
+    storeJSON(g, 'scrap')
+    # loadJSON(g, 'scrap')
+    logging.info('graph and json file built')
+    movie = input("1. Find how much a movie has grossed")
+    print(str(movie) + " has profit of "+g.getMovieVertex(str(movie)).getProfit())
+
+    actor = input("2. List which movies an actor has worked in")
+    print(str(actor) + " has been in movies: "+g.getActorVertex(str(actor)).getMovies())
+
+    movie2 = input("3. List which actors worked in a movie")
+    print("The cast of " + str(movie2) + " are: "+g.getMovieVertex(str(movie)).getActors())
+
+    num1 = input("4. List the top X actors with the most total grossing value")
+    print("The top" + str(num1) + " actors with the most total grossing value are: "+g.getRichest(int(num1)))
+
+    num2 = input("5. List the oldest X actors")
+    print("The oldest " + str(num2) + " actors are: "+g.getOldest(int(num2)))
+
+    year = input("6. List all the movies for a given year")
+    print("Movies in " + str(year) + ": "+g.movieOfThatYear(str(year)))
+
+    year2 = input("7. List all the actors for a given year")
+    print("Actors born in " + str(year2) + ": "+g.actorBornThatYear(str(year2)))
